@@ -1,0 +1,95 @@
+#define TINY_GSM_MODEM_SIM7600
+#include <TinyGsmClient.h>
+
+#define SerialMon Serial
+#define SerialAT Serial1
+
+#define MODEM_RST 15
+#define MODEM_PWRKEY 4
+#define MODEM_TX 17
+#define MODEM_RX 16
+
+const char apn[]  = "internet";
+const char user[] = "";
+const char pass[] = "";
+
+const char* serverHost = "web.pinikdb.online";
+const int serverPort = 80;
+const char* apiKey = "f9d1a4e8b5c93ad6eab7f1c80c9b0a1234f98b5d67f5c1123eaa7b9c2e3d8f45";
+
+const char* project_name = "esp32_randomizer";
+const char* table_name   = "random_log";
+
+TinyGsm modem(SerialAT);
+TinyGsmClient client(modem);
+
+void setup() {
+  SerialMon.begin(115200);
+  delay(10);
+  SerialMon.println("Initializing modem...");
+
+  SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  delay(3000);
+
+  pinMode(MODEM_RST, OUTPUT);
+  digitalWrite(MODEM_RST, HIGH);
+  delay(1000);
+
+  modem.restart();
+  SerialMon.println("Modem restarted.");
+
+  String modemInfo = modem.getModemInfo();
+  SerialMon.print("Modem Info: ");
+  SerialMon.println(modemInfo);
+
+  SerialMon.println("Connecting to network...");
+  if (!modem.gprsConnect(apn, user, pass)) {
+    SerialMon.println("GPRS connection failed!");
+    while (true);
+  }
+  SerialMon.println("GPRS connected!");
+}
+
+void loop() {
+  int randomNumber = random(1, 1000);
+  SerialMon.printf("Generated random number: %d\n", randomNumber);
+
+  // Build payload
+  String payload = "project=" + String(project_name);
+  payload += "&table=" + String(table_name);
+  payload += "&random_value=" + String(randomNumber);
+
+  // Build HTTP request manually
+  String request =
+      String("POST /data.php HTTP/1.1\r\n") +
+      "Host: " + serverHost + "\r\n" +
+      "X-API-KEY: " + apiKey + "\r\n" +
+      "Content-Type: application/x-www-form-urlencoded\r\n" +
+      "Content-Length: " + String(payload.length()) + "\r\n\r\n" +
+      payload + "\r\n";
+
+  SerialMon.println("Connecting to server...");
+  if (!client.connect(serverHost, serverPort)) {
+    SerialMon.println("❌ Connection failed");
+    delay(15000);
+    return;
+  }
+
+  client.print(request);
+  SerialMon.println("Request sent!");
+
+  // Read response
+  unsigned long timeout = millis();
+  while (client.connected() && millis() - timeout < 10000) {
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      SerialMon.println(line);
+      timeout = millis();
+    }
+  }
+
+  client.stop();
+  SerialMon.println("Connection closed.\n");
+
+  delay(15000);
+}
