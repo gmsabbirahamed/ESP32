@@ -1,0 +1,211 @@
+#define TINY_GSM_MODEM_SIM800
+
+#include <TinyGsmClient.h>
+#include <PubSubClient.h>
+#include <TinyGPS++.h>
+
+// =====================
+// Serial Ports
+// =====================
+
+#define SerialMon Serial
+
+#define MODEM_RX 16
+#define MODEM_TX 17
+
+#define GPS_RX 26
+#define GPS_TX 27
+
+HardwareSerial SerialAT(1);
+HardwareSerial GPSSerial(2);
+
+// =====================
+// APN Settings
+// =====================
+
+const char apn[]  = "internet";
+const char user[] = "";
+const char pass[] = "";
+
+// =====================
+// MQTT Settings
+// =====================
+
+const char* broker   = "broker.hivemq.com";
+const int mqttPort   = 1883;
+const char* topic    = "sabbir/dev/vehicle/gps";
+
+const char* mqttUser = "";
+const char* mqttPass = "";
+
+// =====================
+// Objects
+// =====================
+
+TinyGsm modem(SerialAT);
+TinyGsmClient gsmClient(modem);
+PubSubClient mqtt(gsmClient);
+
+TinyGPSPlus gps;
+
+// =====================
+
+unsigned long lastSend = 0;
+
+// =====================
+
+void mqttCallback(char* topic, byte* payload, unsigned int length)
+{
+  SerialMon.print("Message: ");
+
+  for (int i = 0; i < length; i++)
+    SerialMon.print((char)payload[i]);
+
+  SerialMon.println();
+}
+
+// =====================
+
+void connectGPRS()
+{
+  SerialMon.println("Connecting GPRS...");
+  modem.gprsDisconnect();
+
+  while (!modem.gprsConnect(apn, user, pass))
+  {
+    SerialMon.println("GPRS Failed");
+    delay(5000);
+  }
+
+  SerialMon.println("GPRS Connected");
+}
+
+// =====================
+
+void connectMQTT()
+{
+  while (!mqtt.connected())
+  {
+    SerialMon.print("Connecting MQTT...");
+
+    String clientId = "ESP32GPS-";
+    clientId += String(random(0xffff), HEX);
+
+    if (mqtt.connect(clientId.c_str(), mqttUser, mqttPass))
+    {
+      SerialMon.println("Connected");
+    }
+    else
+    {
+      SerialMon.print("Failed rc=");
+      SerialMon.println(mqtt.state());
+      delay(5000);
+    }
+  }
+}
+
+// =====================
+
+void sendGPS()
+{
+    if (!gps.location.isValid())
+    {
+        SerialMon.println("Waiting GPS Fix...");
+        return;
+    }
+
+    char payload[128];
+
+    snprintf(payload,
+             sizeof(payload),
+             "%.6f,%.6f,%.2f,%.2f,%u,%02d:%02d:%02d",
+             gps.location.lat(),
+             gps.location.lng(),
+             gps.speed.kmph(),
+             gps.altitude.meters(),
+             gps.satellites.value(),
+             gps.time.hour(),
+             gps.time.minute(),
+             gps.time.second());
+
+    SerialMon.println(payload);
+
+    if (mqtt.publish(topic, payload))
+    {
+        SerialMon.println("GPS Published");
+    }
+    else
+    {
+        SerialMon.println("Publish Failed");
+    }
+}
+
+// =====================
+
+void setup()
+{
+  SerialMon.begin(115200);
+
+  delay(3000);
+
+  SerialMon.println();
+  SerialMon.println("ESP32 GPS MQTT Tracker");
+
+  // SIM800
+
+  SerialAT.begin(9600, SERIAL_8N1, MODEM_RX, MODEM_TX);
+
+  // GPS
+
+  GPSSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  SerialMon.println("Restarting Modem...");
+
+  modem.restart();
+
+  SerialMon.println(modem.getModemInfo());
+
+  connectGPRS();
+
+  mqtt.setServer(broker, mqttPort);
+  mqtt.setCallback(mqttCallback);
+}
+
+// =====================
+
+void loop()
+{
+  // GPS Parser
+
+  while (GPSSerial.available())
+  {
+    gps.encode(GPSSerial.read());
+  }
+
+  // GPRS Check
+
+  if (!modem.isGprsConnected())
+  {
+    SerialMon.println("GPRS Lost");
+    connectGPRS();
+  }
+
+  // MQTT Check
+
+  if (!mqtt.connected())
+  {
+    connectMQTT();
+  }
+
+  mqtt.loop();
+
+  // Send every 10 sec
+
+  if (millis() - lastSend > 10000)
+  {
+    lastSend = millis();
+
+    sendGPS();
+  }
+}
+
