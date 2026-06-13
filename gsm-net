@@ -1,0 +1,858 @@
+#define TINY_GSM_MODEM_SIM7600
+#define TINY_GSM_USE_GPRS true
+#define TINY_GSM_USE_WIFI false
+// #define TINY_GSM_DEBUG SerialMon
+
+#include <Arduino.h>
+#include <TinyGsmClient.h>
+#include <PubSubClient.h>
+
+// ============================================================================
+// HARDWARE CONFIGURATION
+// ============================================================================
+#define SerialMon Serial
+#define SerialAT Serial1
+
+// SIM7600 Pins
+#define MODEM_PWRKEY     15
+#define MODEM_TX         17
+#define MODEM_RX         16
+
+// ============================================================================
+// TIMING CONSTANTS
+// ============================================================================
+const unsigned long NETWORK_TIMEOUT         = 90000;
+const unsigned long GPRS_RETRY_DELAY        = 15000;
+const unsigned long GPRS_MAX_RETRIES        = 5;
+const unsigned long MQTT_RETRY_DELAY        = 8000;
+const unsigned long MQTT_MAX_RETRIES        = 4;
+// const unsigned long MQTT_KEEPALIVE          = 45;      // RE-ENABLED
+// const unsigned long MQTT_SOCKET_TIMEOUT     = 10;      // RE-ENABLED
+const unsigned long MQTT_PING_INTERVAL      = 30000;
+const unsigned long DIAGNOSTIC_INTERVAL     = 300000;
+const unsigned long STATUS_PRINT_INTERVAL   = 60000;
+const unsigned long PUBLISH_INTERVAL        = 10000;
+const unsigned long RESET_COOLDOWN          = 120000;
+const unsigned long HARD_RESET_COOLDOWN     = 300000;
+const unsigned long WATCHDOG_INTERVAL       = 60000;
+// const unsigned long OPERATION_TIMEOUT       = 5 * 60 * 1000;
+const unsigned long OPERATION_TIMEOUT       = 0;
+
+// ============================================================================
+// NETWORK CREDENTIALS
+// ============================================================================
+const char apn[]    = "internet";
+const char user[]   = "";
+const char pass[]   = "";
+
+const char* broker      = "broker2.dma-bd.com";
+const int brokerPort    = 1883;
+const char* mqttUser    = "broker2";
+const char* mqttPass    = "Secret!@#$1234";
+const char* topicPub    = "DMA/GMS/DEV/TEST/data";
+const char* topicSub    = "DMA/GMS/DEV/TEST/cmd";
+const char* topicStatus = "DMA/GMS/DEV/TEST/status";
+
+// ============================================================================
+// SYSTEM STATE MACHINE
+// ============================================================================
+enum SystemState {
+    STATE_BOOTING,
+    STATE_NETWORK_WAIT,
+    STATE_GPRS_CONNECT,
+    STATE_MQTT_CONNECT,
+    STATE_NORMAL,
+    STATE_RECOVER_GPRS,
+    STATE_RECOVER_MQTT,
+    STATE_RECOVER_MODEM_SOFT,
+    STATE_RECOVER_MODEM_HARD,
+    STATE_CRITICAL,
+    STATE_IDLE
+};
+
+// ============================================================================
+// STRUCTURES
+// ============================================================================
+struct RecoveryCounters {
+    uint8_t gprsFailures = 0;
+    uint8_t mqttFailures = 0;
+    uint8_t softResets = 0;
+    uint8_t hardResets = 0;
+    uint32_t lastSuccessfulPublish = 0;
+    uint32_t lastMqttPing = 0;
+};
+
+struct FailCounters {
+    uint8_t gprsFailures = 0;
+    uint8_t mqttFailures = 0;
+    uint8_t deviceIdle = 0;
+};
+struct MaxRetry {
+    uint8_t gprsMaxRetrys = 3;
+    uint8_t mqttMaxRetrys = 3;
+    uint8_t idleMaxRetrys = 3;
+};
+
+struct MessageQueue {
+    static const int MAX_SIZE = 10;
+    struct Message {
+        char topic[64];
+        char payload[128];
+        unsigned long timestamp;
+    } messages[MAX_SIZE];
+    int head = 0;
+    int tail = 0;
+    int count = 0;
+    
+    bool push(const char* topic, const char* payload) {
+        if (count >= MAX_SIZE) return false;
+        strncpy(messages[tail].topic, topic, 63);
+        messages[tail].topic[63] = '\0';
+        strncpy(messages[tail].payload, payload, 127);
+        messages[tail].payload[127] = '\0';
+        messages[tail].timestamp = millis();
+        tail = (tail + 1) % MAX_SIZE;
+        count++;
+        return true;
+    }
+    
+    bool pop(Message& msg) {
+        if (count == 0) return false;
+        msg = messages[head];
+        head = (head + 1) % MAX_SIZE;
+        count--;
+        return true;
+    }
+    
+    bool isEmpty() { return count == 0; }
+};
+
+// ============================================================================
+// GLOBAL VARIABLES
+// ============================================================================
+TinyGsm modem(SerialAT);
+TinyGsmClient mqttClient(modem);
+PubSubClient mqtt(mqttClient);
+
+SystemState currentState = STATE_BOOTING;
+RecoveryCounters recovery;
+MaxRetry maxx;
+FailCounters fail;
+MessageQueue msgQueue;
+
+unsigned long lastStateEntry = 0;
+unsigned long lastPublish = 0;
+unsigned long lastStatus = 0;
+unsigned long lastWatchdog = 0;
+unsigned long lastDiagnostic = 0;
+unsigned long lastMqttActivity = 0;
+unsigned long lastMqttKeepAlive = 0;
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+bool connectToGPRS();
+bool connectToMQTT();
+bool modemSoftReset();
+bool modemHardReset();
+bool modemPowerCycle();
+void publishQueuedMessages();
+void systemRestart();
+void safeDelay(unsigned long ms);
+void logInfo(const char* msg);
+void logError(const char* msg);
+void logWarn(const char* msg);
+void logDebug(const char* msg);
+
+// ============================================================================
+// LOGGING FUNCTIONS
+// ============================================================================
+
+void logMessage(const char* level, const char* msg) {
+    String timestamp = String(millis() / 1000);
+    SerialMon.print("[");
+    SerialMon.print(level);
+    SerialMon.print("][");
+    SerialMon.print(timestamp);
+    SerialMon.print("] ");
+    SerialMon.println(msg);
+}
+
+void logInfo(const char* msg) {
+    logMessage("INFO", msg);
+}
+
+void logError(const char* msg) {
+    logMessage("ERROR", msg);
+}
+
+void logWarn(const char* msg) {
+    logMessage("WARN", msg);
+}
+
+void logDebug(const char* msg) {
+    #ifdef DEBUG_MODE
+    logMessage("DEBUG", msg);
+    #endif
+}
+
+void logInfo(String msg) {
+    logInfo(msg.c_str());
+}
+
+void logError(String msg) {
+    logError(msg.c_str());
+}
+
+void logWarn(String msg) {
+    logWarn(msg.c_str());
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+bool simStatus() {
+    SimStatus status = modem.getSimStatus();
+    if (status != SIM_READY) {
+        logError("SIM not ready");
+        return false;
+    }
+    return true;
+}
+
+bool waitForNetwork() {
+    logInfo("Waiting for network registration...");
+    
+    unsigned long start = millis();
+    while (millis() - start < NETWORK_TIMEOUT) {
+        if (modem.isNetworkConnected()) {
+            String op = modem.getOperator();
+            logInfo("Network: " + op);
+            return true;
+        }
+        
+        if ((millis() - start) % 5000 < 1000) {
+            int reg = modem.getRegistrationStatus();
+            SerialMon.printf("Registration status: %d\n", reg);
+        }
+        
+        safeDelay(1000);
+    }
+    
+    logError("Network timeout");
+    return false;
+}
+
+bool diagnosticsModem() {
+    if (!modem.testAT(6000)) return false;
+
+    if (!simStatus()) return false;
+
+    if (!waitForNetwork())  return false;
+
+    if (modem.getSignalQuality() == 99) return false;
+
+    return true;
+}
+
+void safeDelay(unsigned long ms) {
+    unsigned long start = millis();
+    while (millis() - start < ms) {
+        if (currentState == STATE_NORMAL && mqtt.connected()) {
+            mqtt.loop();
+        }
+        delay(10);
+    }
+}
+
+
+// FIXED: Safe internet check without crashing
+bool checkInternet() {
+    logDebug("Checking internet...");
+    
+    // Use AT command ping instead of TCP connect (more reliable)
+    modem.sendAT("+CIPPING=\"8.8.8.8\",1,32,2000");
+    
+    // Wait for response (max 5 seconds)
+    unsigned long start = millis();
+    while (millis() - start < 5000) {
+        if (modem.waitResponse(1000L, "+CIPPING:") == 1) {
+            logDebug("Internet ping successful");
+            return true;
+        }
+        // Check for timeout response
+        if (modem.waitResponse(100L, "ERROR") == 1) {
+            logDebug("Internet ping failed");
+            return false;
+        }
+    }
+    
+    logDebug("Internet ping timeout");
+    return false;
+}
+
+// FIXED: Safe broker check with timeout and proper cleanup
+bool checkBroker() {
+    logDebug("Checking broker...");
+    
+    // Create a new client instance
+    TinyGsmClient* testClient = new TinyGsmClient(modem);
+    
+    if (!testClient) {
+        logError("Failed to create test client");
+        return false;
+    }
+    
+    // Set timeout
+    testClient->setTimeout(5000);
+    
+    // Attempt connection
+    bool connected = testClient->connect(broker, brokerPort);
+    
+    if (connected) {
+        logDebug("Broker reachable");
+        testClient->stop();
+    } else {
+        logDebug("Broker unreachable");
+    }
+    
+    // Clean up
+    testClient->stop();
+    delete testClient;
+    
+    return connected;
+}
+
+// ============================================================================
+// MODEM POWER MANAGEMENT
+// ============================================================================
+
+void modemPowerOn() {
+    logInfo("Powering ON modem...");
+    
+    pinMode(MODEM_PWRKEY, OUTPUT);
+    digitalWrite(MODEM_PWRKEY, HIGH);
+    delay(500);
+    digitalWrite(MODEM_PWRKEY, LOW);
+    
+    safeDelay(3000);
+    
+    for (int i = 0; i < 20; i++) {
+        if (modem.testAT()) {
+            logInfo("Modem responded to AT");
+            return;
+        }
+        safeDelay(500);
+    }
+    
+    logError("Modem power-on failed");
+}
+
+void modemPowerOff() {
+    logInfo("Powering OFF modem...");
+    
+    pinMode(MODEM_PWRKEY, OUTPUT);
+    digitalWrite(MODEM_PWRKEY, HIGH);
+    safeDelay(2000);
+    digitalWrite(MODEM_PWRKEY, LOW);
+    
+    safeDelay(2000);
+}
+
+// ============================================================================
+// MODEM RESET FUNCTIONS
+// ============================================================================
+
+bool modemSoftReset() {
+    if (millis() - recovery.lastMqttPing < RESET_COOLDOWN && recovery.softResets > 0) {
+        logWarn("Soft reset cooldown active");
+        return false;
+    }
+    
+    logInfo("Performing soft reset...");
+    recovery.lastMqttPing = millis();
+    
+    modem.restart();
+    safeDelay(5000);
+    
+    for (int i = 0; i < 30; i++) {
+        if (modem.testAT()) {
+            recovery.softResets++;
+            logInfo("Soft reset successful");
+            return true;
+        }
+        safeDelay(500);
+    }
+    
+    logError("Soft reset failed");
+    return false;
+}
+
+bool modemHardReset() {
+    if (millis() - recovery.lastMqttPing < HARD_RESET_COOLDOWN && recovery.hardResets > 0) {
+        logWarn("Hard reset cooldown active");
+        return false;
+    }
+    
+    logInfo("Performing hard reset...");
+    recovery.lastMqttPing = millis();
+    
+    // Power cycle instead of GPIO reset (more reliable for SIM7600)
+    modemPowerOff();
+    safeDelay(3000);
+    modemPowerOn();
+    safeDelay(3000);
+    
+    if (modem.testAT()) {
+        recovery.hardResets++;
+        logInfo("Hard reset successful");
+        return true;
+    }
+    
+    logError("Hard reset failed");
+    return false;
+}
+
+bool modemPowerCycle() {
+    logInfo("Power cycling modem...");
+    modemPowerOff();
+    safeDelay(5000);
+    modemPowerOn();
+    safeDelay(5000);
+    return modem.testAT();
+}
+
+// ============================================================================
+// NETWORK FUNCTIONS
+// ============================================================================
+
+
+
+bool connectToGPRS() {
+    logInfo("Connecting to GPRS...");
+    
+    if (modem.isGprsConnected()) {
+        modem.gprsDisconnect();
+        safeDelay(1000);
+    }
+    
+    if (modem.gprsConnect(apn, user, pass)) {
+        safeDelay(2000);
+        String ip = modem.getLocalIP();
+        logInfo("GPRS connected, IP: " + ip);
+        recovery.gprsFailures = 0;
+        return true;
+    }
+    
+    logError("GPRS connection failed");
+    recovery.gprsFailures++;
+    return false;
+}
+
+// ============================================================================
+// MQTT FUNCTIONS
+// ============================================================================
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    char message[128];
+    unsigned int copyLen = length < 127 ? length : 127;
+    memcpy(message, payload, copyLen);
+    message[copyLen] = '\0';
+    
+    logInfo("CMD: " + String(topic) + " = " + String(message));
+    
+    if (String(topic) == topicSub) {
+        if (strcmp(message, "RESTART") == 0) {
+            logInfo("Remote restart command received");
+            safeDelay(100);
+            systemRestart();
+        } else if (strcmp(message, "RESET_MODEM") == 0) {
+            currentState = STATE_RECOVER_MODEM_SOFT;
+        }
+    }
+    
+    lastMqttActivity = millis();
+}
+
+bool connectToMQTT() {
+    if (mqtt.connected()) return true;
+    
+    logInfo("Connecting to MQTT...");
+    mqtt.disconnect();
+    safeDelay(250);
+    
+    String clientId = "GW" + String((uint32_t)ESP.getEfuseMac(), HEX).substring(0, 8);
+    
+    mqtt.setServer(broker, brokerPort);
+    mqtt.setCallback(mqttCallback);
+    mqtt.setKeepAlive(MQTT_KEEPALIVE);
+    mqtt.setSocketTimeout(MQTT_SOCKET_TIMEOUT);
+    
+    bool connected = mqtt.connect(clientId.c_str(), mqttUser, mqttPass);
+    
+    if (connected) {
+        logInfo("MQTT connected");
+        
+        if (mqtt.subscribe(topicSub)) {
+            logInfo("Subscribed to: " + String(topicSub));
+        }
+        
+        char statusMsg[64];
+        snprintf(statusMsg, 64, "ONLINE|rssi:%d|reset:%d", 
+                 modem.getSignalQuality(), recovery.hardResets + recovery.softResets);
+        mqtt.publish(topicStatus, statusMsg);
+        
+        publishQueuedMessages();
+        
+        recovery.mqttFailures = 0;
+        recovery.lastSuccessfulPublish = millis();
+        lastMqttActivity = millis();
+        return true;
+    }
+    
+    int state = mqtt.state();
+    logError("MQTT failed, state: " + String(state));
+    recovery.mqttFailures++;
+    return false;
+}
+
+void publishData() {
+    if (!mqtt.connected()) return;
+    
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+        "{"
+        "\"ts\":%lu,"
+        "\"rssi\":%d,"
+        "\"rssi_pct\":%d,"
+        "\"state\":%d,"
+        "\"uptime\":%lu,"
+        "\"gprs_retry\":%d,"
+        "\"mqtt_retry\":%d,"
+        "\"soft_resets\":%d,"
+        "\"hard_resets\":%d"
+        "}",
+        millis() / 1000,
+        modem.getSignalQuality(),
+        // getSignalPercent(),
+        modem.getSignalQuality(),
+        currentState,
+        millis() / 1000,
+        recovery.gprsFailures,
+        recovery.mqttFailures,
+        recovery.softResets,
+        recovery.hardResets
+    );
+    
+    if (mqtt.publish(topicPub, payload)) {
+        recovery.lastSuccessfulPublish = millis();
+    } else {
+        logWarn("Publish failed, queuing");
+        msgQueue.push(topicPub, payload);
+    }
+}
+
+void publishQueuedMessages() {
+    MessageQueue::Message msg;
+    while (msgQueue.pop(msg)) {
+        if (mqtt.connected()) {
+            if (millis() - msg.timestamp < 300000) {
+                mqtt.publish(msg.topic, msg.payload);
+            }
+        } else {
+            if (msgQueue.count < MessageQueue::MAX_SIZE - 1) {
+                msgQueue.push(msg.topic, msg.payload);
+            }
+            break;
+        }
+        safeDelay(10);
+    }
+}
+
+void mqttKeepAlive() {
+    if (mqtt.connected()) {
+        if (millis() - lastMqttActivity > MQTT_PING_INTERVAL) {
+            mqtt.publish(topicStatus, "PING", true);
+            lastMqttActivity = millis();
+            lastMqttKeepAlive = millis();
+        }
+    }
+}
+
+// ============================================================================
+// DIAGNOSTICS
+// ============================================================================
+
+bool runDiagnostics() {
+    logInfo("Running diagnostics...");
+    
+    bool allOk = true;
+    
+    if (!simStatus()) {
+        logError("SIM failure");
+        allOk = false;
+    }
+    
+    int signal = modem.getSignalQuality();
+    if (signal == 99 || signal < 6) {
+        logError("Poor signal: " + String(signal));
+        allOk = false;
+    } else {
+        SerialMon.printf("Signal: %d (%d%%)\n", signal, modem.getSignalQuality());
+    }
+    
+    if (!modem.isNetworkConnected()) {
+        logError("Not registered on network");
+        allOk = false;
+    }
+    
+    // FIXED: Skip broker check during diagnostics to avoid crash
+    // Just check internet ping instead
+    if (!checkInternet()) {
+        logError("No internet access");
+        allOk = false;
+    } else {
+        logInfo("Internet OK");
+    }
+    
+    return allOk;
+}
+
+// ============================================================================
+// SYSTEM MANAGEMENT
+// ============================================================================
+
+void systemRestart() {
+    logError("System restart initiated");
+    logInfo("Stats - Uptime: " + String(millis() / 1000) + "s");
+    
+    safeDelay(500);
+    SerialMon.flush();
+    SerialAT.flush();
+    safeDelay(500);
+    ESP.restart();
+    
+    while (1) {
+        delay(1000);
+    }
+}
+
+void checkWatchdog() {
+    static SystemState lastState = STATE_BOOTING;
+    
+    if (currentState != lastState) {
+        lastStateEntry = millis();
+        lastState = currentState;
+        logInfo("State: " + String(currentState));
+    }
+    
+    // if (millis() - lastStateEntry > OPERATION_TIMEOUT) {
+    if (OPERATION_TIMEOUT > 0 && millis() - lastStateEntry > OPERATION_TIMEOUT) {
+        logError("State timeout, forcing restart");
+        systemRestart();
+    }
+    
+    if (millis() - lastWatchdog > WATCHDOG_INTERVAL) {
+        lastWatchdog = millis();
+        
+        if (currentState == STATE_NORMAL && 
+            millis() - recovery.lastSuccessfulPublish > 300000) {
+            logWarn("No successful publish for 5 min");
+            currentState = STATE_RECOVER_MQTT;
+        }
+    }
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+bool initializeSystem() {
+    logInfo("Initializing system...");
+    
+    SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+    modemPowerOn();
+    
+    if (!modem.testAT()) {
+        logError("Modem not responding");
+        return false;
+    }
+    
+    // Disable echo for cleaner communication
+    modem.sendAT("E0");
+    modem.waitResponse();
+    
+    modem.sendAT("+CMEE=2");
+    modem.waitResponse();
+    
+    modem.sendAT("+CREG=2");
+    modem.waitResponse();
+    
+    modem.sendAT("+CSCLK=0");
+    modem.waitResponse();
+    
+    return true;
+}
+
+// ============================================================================
+// MAIN SETUP
+// ============================================================================
+
+void setup() {
+    SerialMon.begin(115200);
+    delay(1000);
+    
+    SerialMon.println("\n\n");
+    SerialMon.println("╔══════════════════════════════════════════════════════╗");
+    SerialMon.println("║     A7670E 24/7 PRODUCTION GATEWAY v3.1              ║");
+    SerialMon.println("║     Industrial Grade | Auto-Recovery | Fail-Safe     ║");
+    SerialMon.println("╚══════════════════════════════════════════════════════╝\n");
+    
+    pinMode(MODEM_PWRKEY, OUTPUT);
+    digitalWrite(MODEM_PWRKEY, LOW);
+    
+    modemPowerOff();
+    safeDelay(1000);
+    
+    if (!initializeSystem()) {
+        logError("System initialization failed");
+        safeDelay(2000);
+        systemRestart();
+    }
+    
+    currentState = STATE_NETWORK_WAIT;
+    lastStateEntry = millis();
+    
+    logInfo("Setup complete, entering main loop");
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+
+void loop() {
+    checkWatchdog();
+    
+    switch (currentState) {
+
+        case STATE_NORMAL:
+            if (!modem.isGprsConnected()) {
+                logWarn("GPRS lost in normal mode");
+                currentState = STATE_RECOVER_GPRS;
+                break;
+            }
+            
+            if (!mqtt.connected()) {
+                if (!modem.isGprsConnected()) {
+                    mqtt.disconnect();
+                    currentState = STATE_RECOVER_GPRS;
+                    break;
+                } else {
+                    currentState = STATE_RECOVER_MQTT;
+                    break;
+                }
+                break;
+            }
+            
+            mqtt.loop();
+            mqttKeepAlive();
+            
+            if (millis() - lastPublish > PUBLISH_INTERVAL) {
+                lastPublish = millis();
+                publishData();
+            }
+            
+            if (millis() - lastStatus > STATUS_PRINT_INTERVAL) {
+                lastStatus = millis();
+                SerialMon.printf("[STATUS] GPRS:%d MQTT:%d RSSI:%d%% S:%d\n",
+                    modem.isGprsConnected(),
+                    mqtt.connected(),
+                    // getSignalPercent(),
+                    modem.getSignalQuality(),
+                    currentState);
+            }
+            
+            if (millis() - lastDiagnostic > DIAGNOSTIC_INTERVAL) {
+                lastDiagnostic = millis();
+                runDiagnostics();
+            }
+            
+            safeDelay(100);
+            break;
+
+        case STATE_RECOVER_MQTT:
+            for (int i=0 ; i<3 ; i++) {
+                if (connectToMQTT()) {
+                    fail.mqttFailures = 0;
+                    currentState = STATE_NORMAL;
+                    break;
+                }
+                delay(2000);
+            }
+            fail.mqttFailures++;
+            if (fail.mqttFailures > maxx.mqttMaxRetrys) {
+                currentState = STATE_IDLE;
+            }
+            if (!modem.isGprsConnected()) {
+                currentState = STATE_RECOVER_GPRS;
+            }
+            break;
+            
+        case STATE_RECOVER_GPRS:
+            if (modem.isGprsConnected()) {
+                currentState = STATE_RECOVER_MQTT;
+                break;
+            }
+            if (modem.gprsConnect(apn, user, pass)) {
+                currentState = STATE_RECOVER_MQTT;
+                break;
+            }
+            modem.gprsDisconnect();
+            for (int i=0 ; i<3 ; i++) {
+                if (connectToGPRS()) {
+                    currentState = STATE_RECOVER_MQTT;
+                    break;
+                }
+                delay(2000);
+            }
+            fail.gprsFailures++;
+            if (fail.gprsFailures > maxx.gprsMaxRetrys) {
+                currentState = STATE_IDLE;
+            }
+            
+            if (!diagnosticsModem()) {
+                if(!modemSoftReset()) {
+                    modemPowerOff();
+                    for (int i=0 ; i<5000 ; i++) {
+                        delay(2);
+                    }
+                    modemPowerOn();
+                    currentState = STATE_RECOVER_GPRS;
+                }
+            }
+            break;
+
+
+
+        case STATE_IDLE:
+            fail.deviceIdle++;
+            for (int i=0 ; i<30 ; i++) delay(2);
+            if (fail.deviceIdle > maxx.idleMaxRetrys) {
+                currentState = STATE_CRITICAL;
+            }
+            
+            break;
+        case STATE_CRITICAL:
+            logError("Critical state - restarting in 10s");
+            safeDelay(10000);
+            systemRestart();
+            break;
+            
+        default:
+            currentState = STATE_NORMAL;
+            break;
+    }
+}
+
