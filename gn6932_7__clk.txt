@@ -183,8 +183,14 @@ void clearDisplay()
 
 void setDigit(uint8_t position, uint8_t value)
 {
-    if (position < 1 || position > 16) return;
-    if (value > 9) return;
+    if (position < 1 || position > 16) {
+        Serial.printf("setDigit: bad position %u\n", position);
+        return;
+    }
+    if (value > 9) {
+        Serial.printf("setDigit: bad value %u at pos %u\n", value, position);
+        return;
+    }
     displayBuffer[position - 1] = digitTable[value];
 }
 
@@ -258,7 +264,7 @@ void updateDate(int day, int month, int year)
     setDigitDP(14, month % 10);
 
     setDigit(15, yy / 10);
-    setDigit(16, yy % 100);
+    setDigit(16, yy % 10);
 }
 
 
