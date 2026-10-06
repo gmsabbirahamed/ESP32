@@ -1,0 +1,775 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <MCP7940.h>
+
+MCP7940_Class MCP7940;
+
+
+// ============================================================
+// GN6932 PINS
+// ============================================================
+
+#define DIN  12
+#define CLK  13
+#define STB  27
+
+
+// ============================================================
+// BUTTONS
+//
+// All buttons connect between GPIO and GND.
+// Internal pull-ups are enabled.
+//
+// GPIO 14 = MODE  (short press = next field, long press = save/exit)
+// GPIO 25 = UP    (+1 on current field)
+// GPIO 26 = DOWN  (-1 on current field)
+// ============================================================
+
+#define BTN_MODE_PIN  14
+#define BTN_UP_PIN    25
+#define BTN_DOWN_PIN  26
+
+
+// ============================================================
+// SEGMENT MAPPING
+// ============================================================
+
+#define SEG_A   0x20
+#define SEG_B   0x80
+#define SEG_C   0x01
+#define SEG_D   0x02
+#define SEG_E   0x08
+#define SEG_F   0x10
+#define SEG_G   0x40
+#define SEG_DP  0x04
+
+
+// ============================================================
+// DIGIT TABLE
+// ============================================================
+
+const uint8_t digitTable[10] =
+{
+    SEG_A | SEG_B | SEG_C | SEG_D | SEG_E | SEG_F,          // 0
+    SEG_B | SEG_C,                                          // 1
+    SEG_A | SEG_B | SEG_D | SEG_E | SEG_G,                  // 2
+    SEG_A | SEG_B | SEG_C | SEG_D | SEG_G,                  // 3
+    SEG_B | SEG_C | SEG_F | SEG_G,                          // 4
+    SEG_A | SEG_C | SEG_D | SEG_F | SEG_G,                  // 5
+    SEG_A | SEG_C | SEG_D | SEG_E | SEG_F | SEG_G,          // 6
+    SEG_A | SEG_B | SEG_C,                                  // 7
+    SEG_A | SEG_B | SEG_C | SEG_D | SEG_E | SEG_F | SEG_G,  // 8
+    SEG_A | SEG_B | SEG_C | SEG_D | SEG_F | SEG_G           // 9
+};
+
+
+// ============================================================
+// DISPLAY BUFFER
+//
+// 1  2     = Hour
+// 3  4     = Minute
+// 5        = unused
+// 6  7     = Second
+// 8  9 10  = unused
+// 11 12    = Day
+// 13 14    = Month
+// 15 16    = Year
+// ============================================================
+
+uint8_t displayBuffer[16];
+
+
+// ============================================================
+// EDIT MODES
+// ============================================================
+
+enum EditMode
+{
+    EDIT_NONE = 0,
+    EDIT_HOUR,
+    EDIT_MINUTE,
+    EDIT_SECOND,
+    EDIT_DAY,
+    EDIT_MONTH,
+    EDIT_YEAR,
+    EDIT_COUNT      // keep last
+};
+
+
+EditMode currentMode = EDIT_NONE;
+
+
+// ============================================================
+// WORKING COPY OF TIME WHILE EDITING
+// ============================================================
+
+DateTime editTime;
+
+
+// ============================================================
+// BUTTON DEBOUNCE / LONG-PRESS
+// ============================================================
+
+struct Button
+{
+    uint8_t       pin;
+    bool          lastState;
+    bool          stableState;
+    unsigned long lastChange;
+    unsigned long pressedAt;
+    bool          longPressFired;
+};
+
+Button btnMode = { BTN_MODE_PIN,  HIGH, HIGH, 0, 0, false };
+Button btnUp   = { BTN_UP_PIN,    HIGH, HIGH, 0, 0, false };
+Button btnDown = { BTN_DOWN_PIN,  HIGH, HIGH, 0, 0, false };
+
+const unsigned long DEBOUNCE_MS    = 40;
+const unsigned long LONG_PRESS_MS  = 1200;
+const unsigned long REPEAT_DELAY   = 500;   // hold delay before auto-repeat
+const unsigned long REPEAT_PERIOD  = 150;   // auto-repeat period
+
+
+// ============================================================
+// LOW-LEVEL GN6932 DRIVER
+// ============================================================
+
+void writeByte(uint8_t data)
+{
+    for (int i = 0; i < 8; i++)
+    {
+        digitalWrite(CLK, LOW);
+        digitalWrite(DIN, data & 0x01);
+        digitalWrite(CLK, HIGH);
+        data >>= 1;
+    }
+    digitalWrite(CLK, LOW);
+}
+
+
+void command(uint8_t cmd)
+{
+    digitalWrite(STB, LOW);
+    writeByte(cmd);
+    digitalWrite(STB, HIGH);
+}
+
+
+void updateDisplay()
+{
+    command(0x40);
+    digitalWrite(STB, LOW);
+    writeByte(0xC0);
+
+    for (int i = 0; i < 16; i++)
+        writeByte(displayBuffer[i]);
+
+    digitalWrite(STB, HIGH);
+}
+
+
+void clearDisplay()
+{
+    for (int i = 0; i < 16; i++)
+        displayBuffer[i] = 0x00;
+
+    updateDisplay();
+}
+
+
+// ============================================================
+// DIGIT HELPERS
+// ============================================================
+
+void setDigit(uint8_t position, uint8_t value)
+{
+    if (position < 1 || position > 16) return;
+    if (value > 9) return;
+    displayBuffer[position - 1] = digitTable[value];
+}
+
+
+void setDigitDP(uint8_t position, uint8_t value)
+{
+    if (position < 1 || position > 16) return;
+    if (value > 9) return;
+    displayBuffer[position - 1] = digitTable[value] | SEG_DP;
+}
+
+
+void blankDigit(uint8_t position)
+{
+    if (position < 1 || position > 16) return;
+    displayBuffer[position - 1] = 0x00;
+}
+
+
+// ============================================================
+// 12-HOUR HELPERS
+// ============================================================
+
+int convertTo12Hour(int hour24)
+{
+    int h = hour24 % 12;
+    if (h == 0) h = 12;
+    return h;
+}
+
+bool isPM(int hour24)
+{
+    return hour24 >= 12;
+}
+
+
+// ============================================================
+// FIELD RENDERERS
+// ============================================================
+
+void updateHour12(int hour24)
+{
+    int hour12 = convertTo12Hour(hour24);
+    setDigit(1, hour12 / 10);
+    setDigitDP(2, hour12 % 10);
+}
+
+
+void updateMinute(int minute)
+{
+    setDigit(3, minute / 10);
+    setDigitDP(4, minute % 10);
+}
+
+
+void updateSecond(int second)
+{
+    setDigit(6, second / 10);
+    setDigit(7, second % 10);
+}
+
+
+void updateDate(int day, int month, int year)
+{
+    int yy = year % 100;
+
+    setDigit(11, day / 10);
+    setDigitDP(12, day % 10);
+
+    setDigit(13, month / 10);
+    setDigitDP(14, month % 10);
+
+    setDigit(15, yy / 10);
+    setDigit(16, yy % 100);
+}
+
+
+// ============================================================
+// HIGHLIGHT (BLINK) THE FIELD CURRENTLY BEING EDITED
+//
+// Blinking is done by periodically blanking the corresponding
+// digits. Call this from loop() with a millis() toggle.
+// ============================================================
+
+void renderEditHighlight(bool visible)
+{
+    switch (currentMode)
+    {
+        case EDIT_HOUR:
+            if (!visible) { blankDigit(1); blankDigit(2); }
+            break;
+
+        case EDIT_MINUTE:
+            if (!visible) { blankDigit(3); blankDigit(4); }
+            break;
+
+        case EDIT_SECOND:
+            if (!visible) { blankDigit(6); blankDigit(7); }
+            break;
+
+        case EDIT_DAY:
+            if (!visible) { blankDigit(11); blankDigit(12); }
+            break;
+
+        case EDIT_MONTH:
+            if (!visible) { blankDigit(13); blankDigit(14); }
+            break;
+
+        case EDIT_YEAR:
+            if (!visible) { blankDigit(15); blankDigit(16); }
+            break;
+
+        default:
+            break;
+    }
+}
+
+
+// ============================================================
+// DRAW FROM A DATETIME OBJECT
+// ============================================================
+
+void drawDateTime(const DateTime& dt)
+{
+    updateHour12(dt.hour());
+    updateMinute(dt.minute());
+    updateSecond(dt.second());
+    updateDate(dt.day(), dt.month(), dt.year());
+}
+
+
+// ============================================================
+// APPLY EDITING FIELD INCREMENTS / WRAPAROUND
+// ============================================================
+
+int wrapInt(int value, int minVal, int maxVal)
+{
+    int range = maxVal - minVal + 1;
+    while (value < minVal) value += range;
+    while (value > maxVal) value -= range;
+    return value;
+}
+
+
+int daysInMonth(int month, int year)
+{
+    static const int d[] =
+        { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+
+    if (month == 2)
+    {
+        bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        return leap ? 29 : 28;
+    }
+    if (month < 1 || month > 12) return 31;
+    return d[month - 1];
+}
+
+
+void applyAdjust(int direction)
+{
+    if (currentMode == EDIT_NONE) return;
+
+    int y = editTime.year();
+    int mo = editTime.month();
+    int d = editTime.day();
+    int h = editTime.hour();
+    int mi = editTime.minute();
+    int s = editTime.second();
+
+    switch (currentMode)
+    {
+        case EDIT_HOUR:
+            h = wrapInt(h + direction, 0, 23);
+            break;
+
+        case EDIT_MINUTE:
+            mi = wrapInt(mi + direction, 0, 59);
+            break;
+
+        case EDIT_SECOND:
+            s = wrapInt(s + direction, 0, 59);
+            break;
+
+        case EDIT_DAY:
+        {
+            int dim = daysInMonth(mo, y);
+            d = wrapInt(d + direction, 1, dim);
+            break;
+        }
+
+        case EDIT_MONTH:
+            mo = wrapInt(mo + direction, 1, 12);
+            // clamp day to new month
+            d = min(d, daysInMonth(mo, y));
+            break;
+
+        case EDIT_YEAR:
+            y = wrapInt(y + direction, 2000, 2099);
+            // clamp day for leap-year changes
+            d = min(d, daysInMonth(mo, y));
+            break;
+
+        default:
+            return;
+    }
+
+    editTime = DateTime(y, mo, d, h, mi, s);
+}
+
+
+// ============================================================
+// SERIAL PRINT
+// ============================================================
+
+void printDateTime(const DateTime& dt, const char* prefix)
+{
+    int h12 = convertTo12Hour(dt.hour());
+    const char* ap = isPM(dt.hour()) ? "PM" : "AM";
+
+    Serial.printf(
+        "%s%04d-%02d-%02d  %02d:%02d:%02d %s\n",
+        prefix,
+        dt.year(), dt.month(), dt.day(),
+        h12, dt.minute(), dt.second(), ap
+    );
+}
+
+
+const char* modeName(EditMode m)
+{
+    switch (m)
+    {
+        case EDIT_NONE:   return "RUN";
+        case EDIT_HOUR:   return "HOUR";
+        case EDIT_MINUTE: return "MINUTE";
+        case EDIT_SECOND: return "SECOND";
+        case EDIT_DAY:    return "DAY";
+        case EDIT_MONTH:  return "MONTH";
+        case EDIT_YEAR:   return "YEAR";
+        default:          return "?";
+    }
+}
+
+
+// ============================================================
+// BUTTON HANDLING
+// ============================================================
+
+enum ButtonEvent
+{
+    EV_NONE = 0,
+    EV_SHORT,
+    EV_LONG,
+    EV_HOLD   // repeat while held
+};
+
+ButtonEvent readButton(Button& b)
+{
+    unsigned long now = millis();
+    bool raw = digitalRead(b.pin);
+
+    // Debounce
+    if (raw != b.lastState)
+    {
+        b.lastChange = now;
+        b.lastState = raw;
+    }
+
+    if (now - b.lastChange < DEBOUNCE_MS)
+        return EV_NONE;
+
+    if (raw != b.stableState)
+    {
+        b.stableState = raw;
+
+        if (b.stableState == LOW)
+        {
+            // press start
+            b.pressedAt = now;
+            b.longPressFired = false;
+            return EV_NONE;
+        }
+        else
+        {
+            // release
+            unsigned long held = now - b.pressedAt;
+
+            if (!b.longPressFired && held >= LONG_PRESS_MS)
+                return EV_LONG;
+
+            if (!b.longPressFired && held < LONG_PRESS_MS)
+                return EV_SHORT;
+
+            return EV_NONE;
+        }
+    }
+
+    // Holding
+    if (b.stableState == LOW)
+    {
+        unsigned long held = now - b.pressedAt;
+
+        if (!b.longPressFired && held >= LONG_PRESS_MS)
+        {
+            b.longPressFired = true;
+            return EV_LONG;
+        }
+
+        if (b.longPressFired)
+        {
+            // auto-repeat
+            static unsigned long lastRepeat[4] = {0};
+            int idx = (b.pin == BTN_MODE_PIN) ? 0 :
+                      (b.pin == BTN_UP_PIN)   ? 1 : 2;
+
+            if (now - lastRepeat[idx] >= REPEAT_PERIOD)
+            {
+                lastRepeat[idx] = now;
+                return EV_HOLD;
+            }
+        }
+    }
+
+    return EV_NONE;
+}
+
+
+// ============================================================
+// MENU ACTIONS
+// ============================================================
+
+void enterEditMode()
+{
+    currentMode = EDIT_HOUR;
+    editTime = MCP7940.now();
+
+    Serial.printf("EDIT MODE -> %s\n", modeName(currentMode));
+}
+
+
+void nextEditMode()
+{
+    if (currentMode == EDIT_NONE)
+    {
+        enterEditMode();
+        return;
+    }
+
+    int next = (int)currentMode + 1;
+
+    if (next >= EDIT_COUNT)
+    {
+        // Save and exit
+        MCP7940.adjust(editTime);
+        currentMode = EDIT_NONE;
+
+        Serial.print("SAVED -> ");
+        printDateTime(MCP7940.now(), "");
+
+        return;
+    }
+
+    currentMode = (EditMode)next;
+    Serial.printf("EDIT MODE -> %s\n", modeName(currentMode));
+}
+
+
+void cancelEditMode()
+{
+    currentMode = EDIT_NONE;
+    Serial.println("EDIT CANCELLED");
+}
+
+
+// ============================================================
+// BUTTON PROCESSING
+// ============================================================
+
+void handleButtons()
+{
+    ButtonEvent evMode = readButton(btnMode);
+    ButtonEvent evUp   = readButton(btnUp);
+    ButtonEvent evDown = readButton(btnDown);
+
+    // MODE
+    if (evMode == EV_SHORT)
+    {
+        nextEditMode();
+    }
+    else if (evMode == EV_LONG)
+    {
+        // Long press MODE = save & exit (or cancel)
+        if (currentMode != EDIT_NONE)
+        {
+            MCP7940.adjust(editTime);
+            currentMode = EDIT_NONE;
+
+            Serial.print("SAVED (long press) -> ");
+            printDateTime(MCP7940.now(), "");
+        }
+    }
+
+    // UP
+    if (evUp == EV_SHORT || evUp == EV_HOLD)
+    {
+        if (currentMode == EDIT_NONE)
+            enterEditMode();
+        else
+            applyAdjust(+1);
+    }
+
+    // DOWN
+    if (evDown == EV_SHORT || evDown == EV_HOLD)
+    {
+        if (currentMode == EDIT_NONE)
+            enterEditMode();
+        else
+            applyAdjust(-1);
+    }
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(500);
+
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println(" ESP32 GN6932 RTC CLOCK");
+    Serial.println(" 12-HOUR FORMAT + MENU");
+    Serial.println("==============================");
+
+    // Buttons
+    pinMode(BTN_MODE_PIN, INPUT_PULLUP);
+    pinMode(BTN_UP_PIN,   INPUT_PULLUP);
+    pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
+
+    // GN6932
+    pinMode(DIN, OUTPUT);
+    pinMode(CLK, OUTPUT);
+    pinMode(STB, OUTPUT);
+
+    digitalWrite(DIN, LOW);
+    digitalWrite(CLK, LOW);
+    digitalWrite(STB, HIGH);
+
+    delay(100);
+
+    // Display ON, maximum brightness
+    command(0x8F);
+    clearDisplay();
+
+    // RTC
+    Serial.println("Initializing MCP7940...");
+    while (!MCP7940.begin())
+    {
+        Serial.println("Unable to find MCP7940N. Retrying in 3 seconds...");
+        delay(3000);
+    }
+    Serial.println("MCP7940 detected.");
+
+    if (!MCP7940.deviceStatus())
+    {
+        Serial.println("RTC oscillator OFF. Starting...");
+        MCP7940.deviceStart();
+        delay(100);
+    }
+
+    MCP7940.setBattery(true);
+
+    DateTime now = MCP7940.now();
+    Serial.println();
+    Serial.print("RTC current time: ");
+    printDateTime(now, "");
+
+    // Initial display
+    drawDateTime(now);
+    updateDisplay();
+
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println(" RTC CLOCK READY");
+    Serial.println("==============================");
+    Serial.println(" GPIO 25 = MODE (short=next, long=save)");
+    Serial.println(" GPIO 26 = UP");
+    Serial.println(" GPIO 14 = DOWN");
+    Serial.println();
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop()
+{
+    handleButtons();
+
+    // --------------------------------------------------------
+    // Determine the DateTime to show
+    // --------------------------------------------------------
+    DateTime now;
+
+    if (currentMode == EDIT_NONE)
+        now = MCP7940.now();
+    else
+        now = editTime;
+
+    // --------------------------------------------------------
+    // Redraw display
+    // --------------------------------------------------------
+    static int lastSec   = -1;
+    static int lastMin   = -1;
+    static int lastHour  = -1;
+    static int lastDay   = -1;
+    static int lastMon   = -1;
+    static int lastYear  = -1;
+    static EditMode lastMode = (EditMode)-1;
+
+    bool changed =
+        now.second() != lastSec   ||
+        now.minute() != lastMin   ||
+        now.hour()   != lastHour  ||
+        now.day()    != lastDay   ||
+        now.month()  != lastMon   ||
+        now.year()   != lastYear  ||
+        currentMode  != lastMode;
+
+    if (changed)
+    {
+        // Full re-render
+        drawDateTime(now);
+
+        lastSec  = now.second();
+        lastMin  = now.minute();
+        lastHour = now.hour();
+        lastDay  = now.day();
+        lastMon  = now.month();
+        lastYear = now.year();
+        lastMode = currentMode;
+
+        // Blink overlay for edit mode
+        static bool blinkOn = true;
+        static unsigned long lastBlink = 0;
+        unsigned long ms = millis();
+
+        if (currentMode != EDIT_NONE)
+        {
+            if (ms - lastBlink >= 300)
+            {
+                lastBlink = ms;
+                blinkOn = !blinkOn;
+            }
+            renderEditHighlight(blinkOn);
+        }
+
+        updateDisplay();
+    }
+
+    // --------------------------------------------------------
+    // Blink refresh (independent of time changes)
+    // --------------------------------------------------------
+    if (currentMode != EDIT_NONE)
+    {
+        static bool blinkOn = true;
+        static unsigned long lastBlink = 0;
+        unsigned long ms = millis();
+
+        if (ms - lastBlink >= 300)
+        {
+            lastBlink = ms;
+            blinkOn = !blinkOn;
+
+            // Re-render, then blank the editing field if needed
+            drawDateTime(currentMode == EDIT_NONE ? MCP7940.now() : editTime);
+            renderEditHighlight(blinkOn);
+            updateDisplay();
+        }
+    }
+
+    delay(20);
+}
